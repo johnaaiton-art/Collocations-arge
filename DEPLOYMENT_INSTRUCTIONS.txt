@@ -1,0 +1,147 @@
+=== COMPLETE DEPLOYMENT INSTRUCTIONS ===
+English Arge Bot - From PC to GitHub to Yandex VM
+
+PART 1: LOCAL SETUP (Your PC)
+==============================
+
+1. Create folder and copy files:
+   Location: C:\Users\John\YandexDisk\Python\innovative vocab\AI magic\yandex\english_arge
+   
+   Copy these files to the folder:
+   - english_arge_bot.py
+   - requirements.txt
+   - README.md
+   - .gitignore (rename from .gitignore_arge)
+   
+   DO NOT copy google-creds.json (it's already in parent folder)
+
+2. Initialize Git:
+   cd "C:\Users\John\YandexDisk\Python\innovative vocab\AI magic\yandex\english_arge"
+   git init
+   git add english_arge_bot.py requirements.txt README.md .gitignore
+   git commit -m "Initial commit: English Arge bot"
+
+3. Push to GitHub:
+   git remote add origin https://github.com/johnaaiton-art/Collocations-arge.git
+   git branch -M main
+   git push -u origin main
+
+
+PART 2: YANDEX VM SETUP
+=======================
+
+1. SSH to your VM:
+   ssh yc-user@YOUR_VM_IP
+
+2. Create folder and clone repo:
+   cd ~
+   git clone https://github.com/johnaaiton-art/Collocations-arge.git english-arge-bot
+   cd english-arge-bot
+
+3. Create virtual environment:
+   python3 -m venv venv
+   source venv/bin/activate
+
+4. Install dependencies:
+   pip install -r requirements.txt
+
+5. Create .env file:
+   nano .env
+   
+   Add these lines (replace with your actual values):
+   TELEGRAM_BOT_TOKEN=your_bot_token_here
+   DEEPSEEK_API_KEY=your_deepseek_key
+   YANDEX_API_KEY=your_yandex_key
+   YANDEX_FOLDER_ID=your_yandex_folder_id
+   
+   Save: Ctrl+X, then Y, then Enter
+
+6. Upload google-creds.json:
+   Option A: Use scp from your PC:
+   scp "C:\Users\John\YandexDisk\Python\innovative vocab\AI magic\yandex\google-creds.json" yc-user@YOUR_VM_IP:~/english-arge-bot/
+   
+   Option B: Copy paste contents:
+   nano google-creds.json
+   (Paste the entire JSON content, save with Ctrl+X, Y, Enter)
+
+7. Test the bot:
+   python english_arge_bot.py
+   
+   Test in Telegram:
+   - /start
+   - setback def
+   
+   Press Ctrl+C to stop
+
+
+PART 3: CREATE SYSTEMD SERVICE
+===============================
+
+1. Create service file:
+   sudo nano /etc/systemd/system/english-arge-bot.service
+
+2. Paste this content:
+
+[Unit]
+Description=English Arge Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=yc-user
+WorkingDirectory=/home/yc-user/english-arge-bot
+Environment="TELEGRAM_BOT_TOKEN=your_token"
+Environment="DEEPSEEK_API_KEY=your_key"
+Environment="YANDEX_API_KEY=your_key"
+Environment="YANDEX_FOLDER_ID=your_folder_id"
+ExecStart=/home/yc-user/english-arge-bot/venv/bin/python3 /home/yc-user/english-arge-bot/english_arge_bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+
+3. Save and exit (Ctrl+X, Y, Enter)
+
+4. Enable and start service:
+   sudo systemctl daemon-reload
+   sudo systemctl enable english-arge-bot.service
+   sudo systemctl start english-arge-bot.service
+
+5. Check status:
+   sudo systemctl status english-arge-bot.service
+
+6. View logs:
+   sudo journalctl -u english-arge-bot.service -f
+
+
+PART 4: FUTURE UPDATES
+======================
+
+On your PC:
+1. Make changes to files
+2. git add .
+3. git commit -m "Description of changes"
+4. git push origin main
+
+On Yandex VM:
+1. cd ~/english-arge-bot
+2. git pull origin main
+3. sudo systemctl restart english-arge-bot.service
+4. sudo systemctl status english-arge-bot.service
+
+
+QUICK REFERENCE COMMANDS
+========================
+
+View logs:
+sudo journalctl -u english-arge-bot.service -f
+
+Restart bot:
+sudo systemctl restart english-arge-bot.service
+
+Stop bot:
+sudo systemctl stop english-arge-bot.service
+
+Check status:
+sudo systemctl status english-arge-bot.service
