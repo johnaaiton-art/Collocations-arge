@@ -12,6 +12,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 from openai import OpenAI
 import gspread
 from google.oauth2.service_account import Credentials
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # ------------------ CONFIG ------------------
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
