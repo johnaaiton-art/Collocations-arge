@@ -1,17 +1,24 @@
 import os
 import uuid
+import hashlib
 import logging
 import requests
 import asyncio
 import tempfile
 import base64
 import re
+import json
+import zipfile
+from io import BytesIO
+from datetime import datetime
 from typing import Optional, List, Tuple, Dict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from openai import OpenAI
+from google.cloud import texttospeech
 import gspread
 from google.oauth2.service_account import Credentials
+from google.oauth2 import service_account
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -23,10 +30,37 @@ DEEPSEEK_API_KEY = os.getenv('DEEPSEEK_API_KEY')
 YANDEX_API_KEY = os.getenv('YANDEX_API_KEY')
 YANDEX_FOLDER_ID = os.getenv('YANDEX_FOLDER_ID')
 
-# Google Sheets setup
+# Google credentials file
 GOOGLE_CREDS_FILE = os.path.join(os.path.dirname(__file__), 'google-creds.json')
-SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1Ifaczs-IELEvyb94QI_gfeD5aM3z-K5liapaISwrGnw/edit?gid=0#gid=0"
-SHEET_NAME = "English"
+
+# ------------------ PER-STUDENT CONFIG ------------------
+# Map Telegram user_id (int) → student info
+# spreadsheet_url: their own Google Sheet where collocations are saved
+# name: display name used in messages
+#
+# To add a new student:
+#   1. Create a new Google Sheet for them and share it with your service account
+#   2. Add an entry here with their Telegram user_id
+#
+STUDENT_CONFIG: Dict[int, Dict] = {
+    435346955: {
+        "name": "Tania",
+        "spreadsheet_url": "https://docs.google.com/spreadsheets/d/1G65r-HU41GYOj6p1BF3DqGwzhUk5Mu6tS65cTWALiaI/edit",
+        "sheet_name": "Sheet1",
+    },
+    # Add more students here...
+}
+# Fallback sheet for unknown users (keeps old behaviour)
+DEFAULT_SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1Ifaczs-IELEvyb94QI_gfeD5aM3z-K5liapaISwrGnw/edit?gid=0#gid=0"
+DEFAULT_SHEET_NAME = "English"
+
+# Chirp3-HD voices for /anki TTS (rotating)
+CHIRP_VOICES = [
+    "en-US-Chirp3-HD-Aoede",
+    "en-US-Chirp3-HD-Leda",
+    "en-US-Chirp3-HD-Puck",
+    "en-US-Chirp3-HD-Fenrir",
+]
 
 if not TELEGRAM_BOT_TOKEN or not DEEPSEEK_API_KEY:
     raise EnvironmentError("Missing TELEGRAM_BOT_TOKEN or DEEPSEEK_API_KEY in environment variables.")
@@ -36,7 +70,7 @@ if not YANDEX_API_KEY or not YANDEX_FOLDER_ID:
 
 TEMP_DIR = tempfile.mkdtemp()
 
-# Cache for collocations
+# Cache for collocations: chat_id → list of (english, russian)
 COLLOCATION_CACHE: Dict[int, List[Tuple[str, str]]] = {}
 
 # Initialize DeepSeek client
@@ -290,31 +324,198 @@ SPANISH: consenso"""
         logging.error(f"DeepSeek etymology error: {e}")
         return (f"Etymology for '{word}'", word)
 
+# ------------------ STUDENT HELPERS ------------------
+def get_student_info(user_id: int) -> Dict:
+    """Return student config dict, falling back to defaults for unknown users."""
+    return STUDENT_CONFIG.get(user_id, {
+        "name": "Unknown",
+        "spreadsheet_url": DEFAULT_SPREADSHEET_URL,
+        "sheet_name": DEFAULT_SHEET_NAME,
+    })
+
 # ------------------ GOOGLE SHEETS OPERATIONS ------------------
-def save_collocation_to_sheet(english: str, russian: str) -> bool:
-    """Save a collocation to Google Sheets with timestamp"""
+def save_collocation_to_sheet(english: str, russian: str, user_id: int) -> bool:
+    """Save a collocation to the student's own Google Sheet with timestamp."""
     try:
-        from datetime import datetime
-        
+        student = get_student_info(user_id)
         client = get_google_sheets_client()
         if not client:
             logging.error("Google Sheets client not initialized")
             return False
-        
-        spreadsheet = client.open_by_url(SPREADSHEET_URL)
-        worksheet = spreadsheet.worksheet(SHEET_NAME)
-        
+
+        spreadsheet = client.open_by_url(student["spreadsheet_url"])
+        worksheet = spreadsheet.worksheet(student["sheet_name"])
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
         # Row: English | Russian | Timestamp
         row = [english, russian, timestamp]
         worksheet.append_row(row, value_input_option="USER_ENTERED")
-        logging.info(f"Saved to sheet: {english} | {russian} | {timestamp}")
+        logging.info(f"[{student['name']}] Saved to sheet: {english} | {russian}")
         return True
-        
+
     except Exception as e:
         logging.error(f"Failed to save to sheet: {e}")
         return False
+
+# ------------------ ANKI TTS HELPERS ------------------
+def get_tts_client():
+    """Return a Google Cloud TTS client using service account file."""
+    credentials = service_account.Credentials.from_service_account_file(
+        GOOGLE_CREDS_FILE,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    return texttospeech.TextToSpeechClient(credentials=credentials)
+
+def generate_tts_chirp3_sync(text: str, voice_name: str) -> bytes:
+    """Generate MP3 audio for a short phrase using Chirp3-HD."""
+    client = get_tts_client()
+    synthesis_input = texttospeech.SynthesisInput(text=text)
+    voice = texttospeech.VoiceSelectionParams(
+        language_code="en-US",
+        name=voice_name
+    )
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.MP3
+    )
+    response = client.synthesize_speech(
+        input=synthesis_input, voice=voice, audio_config=audio_config
+    )
+    return response.audio_content
+
+async def generate_tts_chirp3_async(text: str, voice_name: str) -> bytes:
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, generate_tts_chirp3_sync, text, voice_name)
+
+EXPORT_STATE_FILE = os.path.join(os.path.dirname(__file__), 'anki_export_state.json')
+
+def load_export_state() -> Dict:
+    """Load the per-student last-export timestamps from disk."""
+    if os.path.exists(EXPORT_STATE_FILE):
+        try:
+            with open(EXPORT_STATE_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"[ExportState] Could not read state file: {e}")
+    return {}
+
+def save_export_state(state: Dict):
+    """Persist the per-student last-export timestamps to disk."""
+    try:
+        with open(EXPORT_STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logging.error(f"[ExportState] Could not save state file: {e}")
+
+def get_last_export(user_id: int) -> Optional[datetime]:
+    """Return the datetime of the last successful /anki export for this student, or None."""
+    state = load_export_state()
+    ts = state.get(str(user_id))
+    if ts:
+        try:
+            return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            pass
+    return None
+
+def mark_export_done(user_id: int):
+    """Record now as the last successful export time for this student."""
+    state = load_export_state()
+    state[str(user_id)] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_export_state(state)
+
+def fetch_student_collocations(user_id: int) -> Tuple[List[Tuple[str, str]], Optional[datetime]]:
+    """
+    Read rows from the student's sheet that are NEW since their last /anki export.
+    Returns (list of (russian, english) tuples, last_export_datetime or None).
+    Rows must have a timestamp in column 3 (added by save_collocation_to_sheet).
+    """
+    import json as _json
+    student = get_student_info(user_id)
+    client = get_google_sheets_client()
+    if not client:
+        return [], None
+    spreadsheet = client.open_by_url(student["spreadsheet_url"])
+    worksheet = spreadsheet.worksheet(student["sheet_name"])
+    rows = worksheet.get_all_values()
+
+    last_export = get_last_export(user_id)
+    result = []
+
+    for row in rows:
+        if len(row) < 2 or not row[0].strip() or not row[1].strip():
+            continue
+        english = row[0].strip()
+        russian = row[1].strip()
+
+        # If we have a last export time, filter by the row's timestamp (col 3)
+        if last_export and len(row) >= 3 and row[2].strip():
+            try:
+                row_ts = datetime.strptime(row[2].strip(), "%Y-%m-%d %H:%M:%S")
+                if row_ts <= last_export:
+                    continue  # already exported
+            except ValueError:
+                pass  # no parseable timestamp → include it to be safe
+
+        result.append((russian, english))
+
+    return result, last_export
+
+async def build_anki_package(user_id: int) -> Optional[Tuple[str, BytesIO, int, Optional[datetime]]]:
+    """
+    Fetch new collocations since last export, generate Chirp3-HD TTS,
+    and return (zip_filename, zip_buffer, item_count, last_export_datetime).
+
+    Tab file format:  Russian \\t English \\t [sound:filename.mp3]
+    """
+    items, last_export = fetch_student_collocations(user_id)
+    if not items:
+        return None
+
+    student = get_student_info(user_id)
+
+    # Rotate through Chirp voices
+    voice_cycle = CHIRP_VOICES
+
+    tts_tasks = []
+    for idx, (russian, english) in enumerate(items):
+        voice = voice_cycle[idx % len(voice_cycle)]
+        tts_tasks.append(generate_tts_chirp3_async(english, voice))
+
+    logging.info(f"[Anki] Generating TTS for {len(items)} items (student: {student['name']})")
+    audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
+
+    tab_lines = []
+    audio_files: Dict[str, bytes] = {}
+
+    for (russian, english), audio_data in zip(items, audio_results):
+        md5 = hashlib.md5(english.encode()).hexdigest()
+        audio_filename = f"tts_{md5}.mp3"
+        if isinstance(audio_data, Exception) or not audio_data:
+            logging.warning(f"[Anki] TTS failed for '{english}': {audio_data}")
+            tab_lines.append(f"{russian}\t{english}")
+        else:
+            audio_files[audio_filename] = audio_data
+            tab_lines.append(f"{russian}\t{english}\t[sound:{audio_filename}]")
+
+    tab_content = "\n".join(tab_lines)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_name = re.sub(r'[^\w]', '_', student['name'])
+    txt_filename = f"{safe_name}_{timestamp}_anki.txt"
+
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(txt_filename, tab_content.encode('utf-8'))
+        for fname, data in audio_files.items():
+            zf.writestr(fname, data)
+    zip_buffer.seek(0)
+
+    zip_filename = f"{safe_name}_{timestamp}_anki.zip"
+    logging.info(f"[Anki] Package ready: {zip_filename} ({len(items)} cards, {len(audio_files)} audio files)")
+
+    # Mark export done so next /anki only fetches new words
+    mark_export_done(user_id)
+
+    return zip_filename, zip_buffer, len(items), last_export
 
 # ------------------ YANDEX IMAGE GENERATION ------------------
 async def generate_image_with_yandex(prompt: str, update: Update) -> Optional[str]:
@@ -553,8 +754,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Data format error")
         return
     
-    # Save to Google Sheets
-    success = save_collocation_to_sheet(english, russian)
+    # Save to Google Sheets — pass user_id so it goes to their own sheet
+    user_id = query.from_user.id
+    success = save_collocation_to_sheet(english, russian, user_id)
     
     if success:
         await query.edit_message_text(
@@ -566,6 +768,49 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"❌ Save failed. Check Google Sheets configuration.\n\n{english} | {russian}"
         )
+
+async def anki_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/anki — build an Anki zip of new collocations since last export."""
+    user_id = update.effective_user.id
+    student = get_student_info(user_id)
+
+    last_export = get_last_export(user_id)
+    since_msg = (
+        f"since your last export on {last_export.strftime('%d %b %Y %H:%M')}"
+        if last_export else "from your full sheet (first export)"
+    )
+
+    await update.message.reply_text(
+        f"⏳ Building Anki package for {student['name']} — fetching new words {since_msg}..."
+    )
+
+    try:
+        result = await build_anki_package(user_id)
+    except Exception as e:
+        logging.error(f"[/anki] Error for user {user_id}: {e}")
+        await update.message.reply_text(f"❌ Something went wrong: {e}")
+        return
+
+    if result is None:
+        no_words_msg = (
+            f"No new collocations since {last_export.strftime('%d %b %Y %H:%M')}."
+            if last_export else "No collocations found in your sheet yet."
+        )
+        await update.message.reply_text(f"📭 {no_words_msg}")
+        return
+
+    zip_filename, zip_buffer, count, _ = result
+
+    await update.message.reply_document(
+        document=zip_buffer,
+        filename=zip_filename,
+        caption=(
+            f"✅ Anki package ready for {student['name']}!\n\n"
+            f"📦 {count} new card{'s' if count != 1 else ''} {since_msg}\n"
+            f"🎵 Chirp3-HD audio included\n\n"
+            f"Import the .txt file into Anki and drop the .mp3 files into your media folder."
+        )
+    )
 
 # ------------------ MAIN ------------------
 def main():
@@ -580,6 +825,7 @@ def main():
     
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("anki", anki_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_callback))
     
@@ -587,6 +833,7 @@ def main():
     print("   • word def → definition + collocations")
     print("   • word pic → image generation")
     print("   • word etym → etymology + Spanish")
+    print("   • /anki    → Anki zip of new words since last export")
     print("⚠️ Note: Image generation may take 1-3 minutes")
     app.run_polling()
 
