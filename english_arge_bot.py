@@ -325,32 +325,78 @@ SPANISH: consenso"""
         return (f"Etymology for '{word}'", word)
 
 # ------------------ STUDENT HELPERS ------------------
-def get_student_info(user_id: int) -> Dict:
-    """Return student config dict, falling back to defaults for unknown users."""
-    return STUDENT_CONFIG.get(user_id, {
-        "name": "Unknown",
+def _telegram_label(user) -> str:
+    """
+    Build a clean sheet-tab label from a Telegram User object.
+    Priority: @username > First name > user_id
+    Strips leading '@' so the sheet title is just the bare name.
+    """
+    if user is None:
+        return "unknown"
+    if user.username:
+        return user.username          # e.g. "ivan_petrov"
+    if user.first_name:
+        # Replace spaces/special chars that Google Sheets dislikes in tab names
+        return re.sub(r'[^\w\-]', '_', user.first_name.strip())
+    return str(user.id)
+
+
+def get_or_create_worksheet(client, spreadsheet_url: str, tab_name: str):
+    """
+    Open the spreadsheet and return the worksheet named `tab_name`.
+    If no such tab exists yet, create it with the standard header row.
+    """
+    spreadsheet = client.open_by_url(spreadsheet_url)
+    try:
+        return spreadsheet.worksheet(tab_name)
+    except gspread.exceptions.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=tab_name, rows=1000, cols=4)
+        ws.append_row(["English", "Russian", "Timestamp"], value_input_option="USER_ENTERED")
+        logging.info(f"[Sheets] Created new tab '{tab_name}' in {spreadsheet_url}")
+        return ws
+
+
+def get_student_info(user_id: int, telegram_user=None) -> Dict:
+    """
+    Return student config dict.
+
+    • Known students (in STUDENT_CONFIG) → their own dedicated spreadsheet.
+    • Unknown users → DEFAULT_SPREADSHEET_URL, but with a per-user tab named
+      after their Telegram username / first name / user_id.  The tab is created
+      automatically on first save, so no manual setup is needed.
+    """
+    if user_id in STUDENT_CONFIG:
+        return STUDENT_CONFIG[user_id]
+
+    # Auto-assign a tab on the default sheet
+    tab_name = _telegram_label(telegram_user) if telegram_user else str(user_id)
+    return {
+        "name": tab_name,
         "spreadsheet_url": DEFAULT_SPREADSHEET_URL,
-        "sheet_name": DEFAULT_SHEET_NAME,
-    })
+        "sheet_name": tab_name,
+    }
 
 # ------------------ GOOGLE SHEETS OPERATIONS ------------------
-def save_collocation_to_sheet(english: str, russian: str, user_id: int) -> bool:
-    """Save a collocation to the student's own Google Sheet with timestamp."""
+def save_collocation_to_sheet(english: str, russian: str, user_id: int, telegram_user=None) -> bool:
+    """Save a collocation to the student's own Google Sheet tab with timestamp.
+
+    For known students (STUDENT_CONFIG) this uses their dedicated spreadsheet.
+    For unknown users this auto-creates a tab named after their Telegram handle
+    on the default spreadsheet.
+    """
     try:
-        student = get_student_info(user_id)
+        student = get_student_info(user_id, telegram_user)
         client = get_google_sheets_client()
         if not client:
             logging.error("Google Sheets client not initialized")
             return False
 
-        spreadsheet = client.open_by_url(student["spreadsheet_url"])
-        worksheet = spreadsheet.worksheet(student["sheet_name"])
+        worksheet = get_or_create_worksheet(client, student["spreadsheet_url"], student["sheet_name"])
 
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        # Row: English | Russian | Timestamp
         row = [english, russian, timestamp]
         worksheet.append_row(row, value_input_option="USER_ENTERED")
-        logging.info(f"[{student['name']}] Saved to sheet: {english} | {russian}")
+        logging.info(f"[{student['name']}] Saved to sheet tab '{student['sheet_name']}': {english} | {russian}")
         return True
 
     except Exception as e:
@@ -423,19 +469,17 @@ def mark_export_done(user_id: int):
     state[str(user_id)] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_export_state(state)
 
-def fetch_student_collocations(user_id: int) -> Tuple[List[Tuple[str, str]], Optional[datetime]]:
+def fetch_student_collocations(user_id: int, telegram_user=None) -> Tuple[List[Tuple[str, str]], Optional[datetime]]:
     """
     Read rows from the student's sheet that are NEW since their last /anki export.
     Returns (list of (russian, english) tuples, last_export_datetime or None).
     Rows must have a timestamp in column 3 (added by save_collocation_to_sheet).
     """
-    import json as _json
-    student = get_student_info(user_id)
+    student = get_student_info(user_id, telegram_user)
     client = get_google_sheets_client()
     if not client:
         return [], None
-    spreadsheet = client.open_by_url(student["spreadsheet_url"])
-    worksheet = spreadsheet.worksheet(student["sheet_name"])
+    worksheet = get_or_create_worksheet(client, student["spreadsheet_url"], student["sheet_name"])
     rows = worksheet.get_all_values()
 
     last_export = get_last_export(user_id)
@@ -460,18 +504,18 @@ def fetch_student_collocations(user_id: int) -> Tuple[List[Tuple[str, str]], Opt
 
     return result, last_export
 
-async def build_anki_package(user_id: int) -> Optional[Tuple[str, BytesIO, int, Optional[datetime]]]:
+async def build_anki_package(user_id: int, telegram_user=None) -> Optional[Tuple[str, BytesIO, int, Optional[datetime]]]:
     """
     Fetch new collocations since last export, generate Chirp3-HD TTS,
     and return (zip_filename, zip_buffer, item_count, last_export_datetime).
 
     Tab file format:  Russian \\t English \\t [sound:filename.mp3]
     """
-    items, last_export = fetch_student_collocations(user_id)
+    items, last_export = fetch_student_collocations(user_id, telegram_user)
     if not items:
         return None
 
-    student = get_student_info(user_id)
+    student = get_student_info(user_id, telegram_user)
 
     # Rotate through Chirp voices
     voice_cycle = CHIRP_VOICES
@@ -754,9 +798,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Data format error")
         return
     
-    # Save to Google Sheets — pass user_id so it goes to their own sheet
-    user_id = query.from_user.id
-    success = save_collocation_to_sheet(english, russian, user_id)
+    # Save to Google Sheets — pass user_id + full user object for auto-tab naming
+    telegram_user = query.from_user
+    user_id = telegram_user.id
+    success = save_collocation_to_sheet(english, russian, user_id, telegram_user)
     
     if success:
         await query.edit_message_text(
@@ -771,8 +816,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def anki_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/anki — build an Anki zip of new collocations since last export."""
-    user_id = update.effective_user.id
-    student = get_student_info(user_id)
+    telegram_user = update.effective_user
+    user_id = telegram_user.id
+    student = get_student_info(user_id, telegram_user)
 
     last_export = get_last_export(user_id)
     since_msg = (
@@ -785,7 +831,7 @@ async def anki_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
-        result = await build_anki_package(user_id)
+        result = await build_anki_package(user_id, telegram_user)
     except Exception as e:
         logging.error(f"[/anki] Error for user {user_id}: {e}")
         await update.message.reply_text(f"❌ Something went wrong: {e}")
